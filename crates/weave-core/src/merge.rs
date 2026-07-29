@@ -1687,7 +1687,10 @@ fn merge_imports_with_multiline(
             Ok(m) => m,
             Err(conflicted) => conflicted,
         };
-        if !merged_ni.trim().is_empty() {
+        // The main loop already preserved ours's non-import lines in place. Only
+        // append this section when the three-way merge produced different content;
+        // otherwise headers and Rust `};` closers would be duplicated at the end.
+        if merged_ni != ours_ni && !merged_ni.trim().is_empty() {
             result.push('\n');
             result.push('\n');
             result.push_str(&merged_ni);
@@ -1746,9 +1749,18 @@ fn import_source_prefix(line: &str) -> &str {
                 return path;
             }
         }
-        // Rust: "use X::Y;" -> X
+        // Rust: grouped imports must retain the complete module path. Using only
+        // the first segment aliases unrelated blocks such as `super::events::{...}`
+        // and `super::systems::{...}`, causing specifiers to leak between them.
         if let Some(rest) = trimmed.strip_prefix("use ") {
-            return rest.split("::").next().unwrap_or("").trim_end_matches(';');
+            let path = rest.trim_end_matches(';');
+            if let Some((module, _)) = path.split_once("::{") {
+                return module;
+            }
+            if let Some((module, _)) = path.rsplit_once("::") {
+                return module;
+            }
+            return path;
         }
     }
     line.trim()
@@ -4518,6 +4530,89 @@ export function main() { return 1; }
             "import {{ and }} from must be balanced: {} opens vs {} closes\n{}",
             open_count, close_count, result.content
         );
+    }
+
+    #[test]
+    fn test_rust_multiline_use_blocks_do_not_cross_contaminate_or_duplicate_closers() {
+        let base = r#"//! Runtime wiring.
+
+use super::events::{
+    CaptureEvent,
+};
+use super::resources::{
+    CaptureState,
+};
+use super::systems::{
+    run_capture,
+};
+
+pub fn configure() {
+    run_capture();
+}
+"#;
+        let ours = r#"//! Runtime wiring.
+
+use super::events::{
+    CaptureEvent,
+    ResetEvent,
+};
+use super::resources::{
+    CaptureState,
+};
+use super::systems::{
+    run_capture,
+};
+
+pub fn configure() {
+    run_capture();
+}
+"#;
+        let theirs = r#"//! Runtime wiring.
+
+use super::events::{
+    CaptureEvent,
+};
+use super::resources::{
+    CaptureState,
+};
+use super::systems::{
+    run_capture,
+    sync_capture,
+};
+
+pub fn configure() {
+    run_capture();
+    sync_capture();
+}
+"#;
+
+        let result = entity_merge(base, ours, theirs, "runtime.rs");
+        assert!(result.is_clean(), "conflicts: {:?}", result.conflicts);
+        assert_eq!(result.content.matches("//! Runtime wiring.").count(), 1);
+        assert_eq!(
+            result.content.lines().filter(|line| *line == "};").count(),
+            3
+        );
+        assert_eq!(result.content.matches("    ResetEvent,").count(), 1);
+        assert_eq!(result.content.matches("    sync_capture,").count(), 1);
+
+        let events = result
+            .content
+            .split("use super::events::{")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .unwrap();
+        assert!(events.contains("ResetEvent"));
+        assert!(!events.contains("sync_capture"));
+
+        let systems = result
+            .content
+            .split("use super::systems::{")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .unwrap();
+        assert!(systems.contains("sync_capture"));
+        assert!(!systems.contains("ResetEvent"));
     }
 
     #[test]
