@@ -711,11 +711,15 @@ pub(crate) fn merge_interstitials(
             // The rungs, in the order they are allowed to answer. The first
             // one whose answer loses nothing wins; `keeps_everything` is the
             // same predicate for all of them.
-            let mut ladder: Vec<String> = Vec::new();
+            // A rung may answer with conflict markers already in place (the
+            // import union does, for the header or trailer around the imports);
+            // those conflicts travel with the text so the merge is not
+            // reported clean.
+            let mut ladder: Vec<(String, Vec<EntityConflict>)> = Vec::new();
             if ws_ours && ws_theirs {
                 // Both sides only changed whitespace; neither has content to
                 // defer to, so one of them is taken outright.
-                ladder.push(theirs_content.to_string());
+                ladder.push((theirs_content.to_string(), Vec::new()));
             } else if is_import_region(base_content)
                 || is_import_region(ours_content)
                 || is_import_region(theirs_content)
@@ -724,16 +728,21 @@ pub(crate) fn merge_interstitials(
                 // sides may give imports they SHARE contradictory relative
                 // orders; module initialisation is side-effectful, so no
                 // ordering is safe to invent and that is surfaced below.
-                let (result, order_conflict) =
-                    merge_imports_commutatively(base_content, ours_content, theirs_content);
+                let (result, order_conflict, surrounding) = merge_imports_commutatively_in(
+                    base_content,
+                    ours_content,
+                    theirs_content,
+                    marker_format,
+                    key,
+                );
                 order_conflicted = order_conflict;
                 if !order_conflict {
-                    ladder.push(result);
+                    ladder.push((result, surrounding));
                 }
             }
             if !order_conflicted {
                 if let Ok(text) = diffy::merge(base_content, ours_content, theirs_content) {
-                    ladder.push(text);
+                    ladder.push((text, Vec::new()));
                 }
             }
             // The one-sided whitespace rung, DEMOTED below the line merge.
@@ -742,21 +751,23 @@ pub(crate) fn merge_interstitials(
             // boundary silently comes back. A whitespace-only edit is still an
             // edit; it only loses when the lines will not compose.
             if ws_ours != ws_theirs {
-                ladder.push(
+                ladder.push((
                     if ws_ours {
                         theirs_content
                     } else {
                         ours_content
                     }
                     .to_string(),
-                );
+                    Vec::new(),
+                ));
             }
             let candidate = ladder
                 .into_iter()
-                .find(|text| keeps_everything(text) && keeps_additions(text));
+                .find(|(text, _)| keeps_everything(text) && keeps_additions(text));
             match candidate {
-                Some(text) => {
+                Some((text, conflicts)) => {
                     merged.insert(key.to_string(), text);
+                    interstitial_conflicts.extend(conflicts);
                 }
                 None => {
                     let complexity = classify_conflict(
@@ -843,6 +854,73 @@ fn is_import_line(line: &str) -> bool {
         || trimmed.starts_with("package ")
         || trimmed.starts_with("#include ")
         || trimmed.starts_with("using ")
+}
+
+/// If `trimmed` opens a multi-line import block, the character that closes it.
+/// `import {` / `use x::{` close with `}`; Go's `import (` and Python's
+/// `from x import (` close with `)`.
+fn multiline_import_close(trimmed: &str) -> Option<char> {
+    if trimmed.contains('{') && !trimmed.contains('}') {
+        Some('}')
+    } else if (trimmed.starts_with("import (")
+        || (trimmed.starts_with("from ") && trimmed.contains("import (")))
+        && !trimmed.contains(')')
+    {
+        Some(')')
+    } else {
+        None
+    }
+}
+
+/// Go's grouped import: `import (` on its own line, one package path per line,
+/// no separators, blank lines marking gofmt groups. Python's `from x import (`
+/// starts with `from`, so this is unambiguous.
+fn is_go_import_block(opener: &str) -> bool {
+    opener.trim_start().starts_with("import (")
+}
+
+/// Line range `[start, end)` from the first import statement to the end of
+/// the last one, multi-line blocks included. `None` when there are no imports.
+fn import_line_span(lines: &[&str]) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut end = 0;
+    let mut i = 0;
+    while i < lines.len() {
+        if is_import_line(lines[i]) {
+            first.get_or_insert(i);
+            if let Some(close) = multiline_import_close(lines[i].trim()) {
+                i += 1;
+                while i < lines.len() && !lines[i].trim().starts_with(close) {
+                    i += 1;
+                }
+            }
+            end = (i + 1).min(lines.len());
+        }
+        i += 1;
+    }
+    first.map(|f| (f, end))
+}
+
+/// Three-way merge of the text before or after an import section. Trivial
+/// cases short-circuit; `None` is a real disagreement, for the caller to
+/// render as a conflict rather than let one side silently win.
+fn merge_surrounding_text(base: &str, ours: &str, theirs: &str) -> Option<String> {
+    if ours == theirs || base == theirs {
+        return Some(ours.to_string());
+    }
+    if base == ours {
+        return Some(theirs.to_string());
+    }
+    let nl = |s: &str| {
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", s)
+        }
+    };
+    diffy::merge(&nl(base), &nl(ours), &nl(theirs))
+        .ok()
+        .map(|m| m.trim_end_matches('\n').to_string())
 }
 
 /// A complete import statement (possibly multi-line) as a single unit.
@@ -1043,7 +1121,23 @@ fn order_preserving_import_union<'a>(ours: &[&'a str], theirs: &[&'a str]) -> (V
 /// Returns the merged text and whether the two sides gave imports they share
 /// contradictory relative orders (an honest conflict, not something to
 /// silently pick a winner for).
+#[cfg(test)]
 fn merge_imports_commutatively(base: &str, ours: &str, theirs: &str) -> (String, bool) {
+    let (text, order_conflict, _) =
+        merge_imports_commutatively_in(base, ours, theirs, &MarkerFormat::default(), "imports");
+    (text, order_conflict)
+}
+
+/// [`merge_imports_commutatively`] with the marker format and region key the
+/// multi-line path needs to render a header/trailer disagreement in place. The
+/// third value is those conflicts; the text already carries their markers.
+fn merge_imports_commutatively_in(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    marker_format: &MarkerFormat,
+    region_key: &str,
+) -> (String, bool, Vec<EntityConflict>) {
     let (base_imports, _) = parse_import_statements(base);
     let (ours_imports, _) = parse_import_statements(ours);
     let (theirs_imports, _) = parse_import_statements(theirs);
@@ -1053,17 +1147,17 @@ fn merge_imports_commutatively(base: &str, ours: &str, theirs: &str) -> (String,
         || theirs_imports.iter().any(|i| i.is_multiline);
 
     if has_multiline {
-        return (
-            merge_imports_with_multiline(
-                base,
-                ours,
-                theirs,
-                &base_imports,
-                &ours_imports,
-                &theirs_imports,
-            ),
-            false,
+        let (text, conflicts) = merge_imports_with_multiline(
+            base,
+            ours,
+            theirs,
+            &base_imports,
+            &ours_imports,
+            &theirs_imports,
+            marker_format,
+            region_key,
         );
+        return (text, false, conflicts);
     }
 
     // Single-line-only path.
@@ -1385,11 +1479,12 @@ fn merge_imports_commutatively(base: &str, ours: &str, theirs: &str) -> (String,
     for _ in result_trailing..ours_trailing {
         result.push('\n');
     }
-    (result, order_conflict)
+    (result, order_conflict, Vec::new())
 }
 
 /// Merge imports when multi-line import blocks are involved.
 /// Matches imports by source module, merges specifiers as a set.
+#[allow(clippy::too_many_arguments)]
 fn merge_imports_with_multiline(
     _base_raw: &str,
     ours_raw: &str,
@@ -1397,7 +1492,9 @@ fn merge_imports_with_multiline(
     base_imports: &[ImportStatement],
     ours_imports: &[ImportStatement],
     theirs_imports: &[ImportStatement],
-) -> String {
+    marker_format: &MarkerFormat,
+    region_key: &str,
+) -> (String, Vec<EntityConflict>) {
     // Build source → specifier sets for base and theirs.
     // Use entry API to merge specifiers when multiple imports share the same source
     // (e.g. `import type { Foo } from "./foo"` AND `import { type a } from "./foo"`).
@@ -1446,8 +1543,28 @@ fn merge_imports_with_multiline(
     let mut result_parts: Vec<String> = Vec::new();
     let mut handled_theirs_sources: HashSet<&str> = HashSet::new();
 
-    // Walk through ours_raw to preserve formatting (blank lines, comments)
-    let lines: Vec<&str> = ours_raw.lines().collect();
+    // The region is prefix + imports + suffix. Only the import span goes
+    // through the set-wise walk below; the text on either side (file
+    // directives, `//nolint` headers, the comment before the first entity) is
+    // three-way merged on its own. Feeding that text through the walk and then
+    // re-merging it at the end emitted ours's copy in place AND the merged copy
+    // afterwards, which is where duplicated headers came from.
+    let split_at_imports = |content: &str| -> (String, String) {
+        let all: Vec<&str> = content.lines().collect();
+        match import_line_span(&all) {
+            Some((s, e)) => (all[..s].join("\n"), all[e..].join("\n")),
+            None => (all.join("\n"), String::new()),
+        }
+    };
+    let (base_prefix, base_suffix) = split_at_imports(_base_raw);
+    let (ours_prefix, ours_suffix) = split_at_imports(ours_raw);
+    let (theirs_prefix, theirs_suffix) = split_at_imports(_theirs_raw);
+
+    // Walk through ours's import span to preserve formatting (blank lines, comments)
+    let ours_all: Vec<&str> = ours_raw.lines().collect();
+    let (ours_start, ours_end) =
+        import_line_span(&ours_all).unwrap_or((ours_all.len(), ours_all.len()));
+    let lines: &[&str] = &ours_all[ours_start..ours_end];
     let mut i = 0;
     let mut ours_imp_idx = 0;
 
@@ -1462,11 +1579,7 @@ fn merge_imports_with_multiline(
 
         if is_import_line(line) {
             let trimmed = line.trim();
-            let starts_multiline = (trimmed.contains('{') && !trimmed.contains('}'))
-                || (trimmed.starts_with("import (") && !trimmed.contains(')'))
-                || (trimmed.starts_with("from ")
-                    && trimmed.contains("import (")
-                    && !trimmed.contains(')'));
+            let starts_multiline = multiline_import_close(trimmed).is_some();
 
             if starts_multiline && ours_imp_idx < ours_imports.len() {
                 let imp = &ours_imports[ours_imp_idx];
@@ -1504,22 +1617,95 @@ fn merge_imports_with_multiline(
                     }
                 }
 
-                // Detect indentation from the original block
-                let indent = if imp.lines.len() > 1 {
-                    let second = &imp.lines[1];
-                    &second[..second.len() - second.trim_start().len()]
+                let has_closer = imp.lines.len() >= 2
+                    && imp
+                        .lines
+                        .last()
+                        .map(|l| l.trim().starts_with([')', '}']))
+                        .unwrap_or(false);
+                let body_end = if has_closer {
+                    imp.lines.len() - 1
                 } else {
-                    "     "
+                    imp.lines.len()
                 };
+                let body_lines = &imp.lines[1..body_end];
 
-                // Reconstruct multi-line import
-                result_parts.push(imp.lines[0].clone()); // `import {`
-                for spec in &final_specs {
-                    result_parts.push(format!("{}{},", indent, spec));
+                // Detect indentation from the first non-blank line of the block
+                let indent = body_lines
+                    .iter()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| &l[..l.len() - l.trim_start().len()])
+                    .unwrap_or(if is_go_import_block(&imp.lines[0]) {
+                        "\t"
+                    } else {
+                        "    "
+                    });
+
+                result_parts.push(imp.lines[0].clone()); // `import {` / `import (`
+                if is_go_import_block(&imp.lines[0]) {
+                    // Go: paths are not comma-separated, and blank lines are
+                    // gofmt's groups. Keep ours's lines verbatim minus what
+                    // theirs removed, then append theirs's additions before
+                    // the closer. Rendering these as `"fmt",` produced files
+                    // that do not compile.
+                    let mut body: Vec<String> = Vec::new();
+                    for l in body_lines {
+                        let t = l.trim();
+                        if !t.is_empty() && theirs_removed.contains(t) {
+                            continue;
+                        }
+                        body.push(l.clone());
+                    }
+                    for added in &theirs_added {
+                        if body.iter().any(|l| l.trim() == *added) {
+                            continue;
+                        }
+                        let new_line = format!("{}{}", indent, added);
+                        // Where theirs put it: after the nearest path above it
+                        // in theirs's block that ours also has, so it lands in
+                        // the same gofmt group; otherwise at the end.
+                        let anchor = theirs_seq.iter().position(|s| s == added).and_then(|pos| {
+                            theirs_seq[..pos]
+                                .iter()
+                                .rev()
+                                .find_map(|prev| body.iter().rposition(|l| l.trim() == *prev))
+                        });
+                        match anchor {
+                            Some(at) => body.insert(at + 1, new_line),
+                            None => body.push(new_line),
+                        }
+                    }
+                    // A removal can empty a group: collapse blank runs and
+                    // drop blanks at the edges so the block stays gofmt-clean.
+                    let mut collapsed: Vec<String> = Vec::new();
+                    for l in body {
+                        let blank = l.trim().is_empty();
+                        let prev_blank = collapsed
+                            .last()
+                            .map(|p| p.trim().is_empty())
+                            .unwrap_or(true);
+                        if blank && prev_blank {
+                            continue;
+                        }
+                        collapsed.push(l);
+                    }
+                    while collapsed
+                        .last()
+                        .map(|l| l.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        collapsed.pop();
+                    }
+                    result_parts.extend(collapsed);
+                } else {
+                    // Reconstruct multi-line import
+                    for spec in &final_specs {
+                        result_parts.push(format!("{}{},", indent, spec));
+                    }
                 }
                 // Closing line from ours
-                if let Some(last) = imp.lines.last() {
-                    result_parts.push(last.clone());
+                if has_closer {
+                    result_parts.push(imp.lines[imp.lines.len() - 1].clone());
                 }
 
                 // Skip past the original multi-line block in ours_raw
@@ -1639,8 +1825,20 @@ fn merge_imports_with_multiline(
 
     // Add any new imports from theirs that have new sources
     for imp in theirs_imports {
-        if handled_theirs_sources.contains(imp.source.as_str()) {
+        let source = imp.source.as_str();
+        if handled_theirs_sources.contains(source) {
             continue;
+        }
+        // Base had this source and ours dropped it. Theirs merely still
+        // having it, unchanged, is not new content; re-adding it would undo
+        // ours's deletion. Only a theirs-side edit to that import survives.
+        if let Some(base_set) = base_specs.get(source) {
+            let theirs_seq: &[&str] = theirs_specs.get(source).map(Vec::as_slice).unwrap_or(&[]);
+            let unchanged = theirs_seq.len() == base_set.len()
+                && theirs_seq.iter().all(|s| base_set.contains(s));
+            if unchanged {
+                continue;
+            }
         }
         // Truly new import from theirs (source wasn't handled in the main loop)
         for line in &imp.lines {
@@ -1648,61 +1846,44 @@ fn merge_imports_with_multiline(
         }
     }
 
-    let mut result = result_parts.join("\n");
-
-    // Non-import lines: use diffy 3-way merge so adds/deletes/edits on
-    // either side are handled correctly (fixes #60).
-    let extract_non_imports = |content: &str| -> String {
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !is_import_line(l))
-            .filter(|l| {
-                let t = l.trim();
-                // Exclude multi-line import continuation lines:
-                // - specifier lines ending with comma (but not assignments)
-                // - bare closing parens/braces
-                // - closing lines like `} from "./foo"` or `) from "bar"`
-                if (t.ends_with(',') && !t.contains('=')) || t == ")" || t == "}" {
-                    return false;
-                }
-                // Closing line of JS/TS multi-line import: `} from "..."` or `} from '...'`
-                if t.starts_with('}') && t.contains("from ") {
-                    return false;
-                }
-                // Closing line of Python multi-line import: `) ` at end or just `)`
-                if t.starts_with(')') {
-                    return false;
-                }
-                true
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let base_ni = extract_non_imports(_base_raw);
-    let ours_ni = extract_non_imports(ours_raw);
-    let theirs_ni = extract_non_imports(_theirs_raw);
-
-    if !base_ni.is_empty() || !ours_ni.is_empty() || !theirs_ni.is_empty() {
-        let merged_ni = match diffy::merge(&base_ni, &ours_ni, &theirs_ni) {
-            Ok(m) => m,
-            Err(conflicted) => conflicted,
-        };
-        // The main loop already preserved ours's non-import lines in place. Only
-        // append this section when the three-way merge produced different content;
-        // otherwise headers and Rust `};` closers would be duplicated at the end.
-        if merged_ni != ours_ni && !merged_ni.trim().is_empty() {
-            result.push('\n');
-            result.push('\n');
-            result.push_str(&merged_ni);
+    // The header and trailer are merged on their own. A disagreement there is
+    // rendered in place, in the caller's marker format, and reported: the
+    // imports between them are still merged, and the file is not clean.
+    let mut surrounding_conflicts: Vec<EntityConflict> = Vec::new();
+    let mut merge_edge = |place: &str, base: &str, ours: &str, theirs: &str| -> String {
+        match merge_surrounding_text(base, ours, theirs) {
+            Some(text) => text,
+            None => {
+                let conflict = EntityConflict {
+                    entity_name: format!("{} ({})", region_key, place),
+                    entity_type: "interstitial".to_string(),
+                    kind: ConflictKind::BothModified,
+                    complexity: classify_conflict(Some(base), Some(ours), Some(theirs)),
+                    ours_content: Some(ours.to_string()),
+                    theirs_content: Some(theirs.to_string()),
+                    base_content: Some(base.to_string()),
+                };
+                let text = conflict.to_conflict_markers(marker_format, "merge_ladder_exhausted");
+                surrounding_conflicts.push(conflict);
+                text.trim_end_matches('\n').to_string()
+            }
         }
-    }
+    };
+    let merged_prefix = merge_edge("before imports", &base_prefix, &ours_prefix, &theirs_prefix);
+    let merged_suffix = merge_edge("after imports", &base_suffix, &ours_suffix, &theirs_suffix);
+    let middle = result_parts.join("\n");
+    let mut result = [merged_prefix, middle, merged_suffix]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let ours_trailing = ours_raw.len() - ours_raw.trim_end_matches('\n').len();
     let result_trailing = result.len() - result.trim_end_matches('\n').len();
     for _ in result_trailing..ours_trailing {
         result.push('\n');
     }
-    result
+    (result, surrounding_conflicts)
 }
 
 /// Extract the source/module prefix from an import line for group matching.
@@ -1710,6 +1891,14 @@ fn merge_imports_with_multiline(
 ///      "import React from 'react'" -> "react"
 ///      "use std::collections::HashMap;" -> "std::collections"
 fn import_source_prefix(line: &str) -> &str {
+    // Go grouped block. Every block in a file draws from the one package
+    // namespace, so they all share a key. Without this the fallback below
+    // keyed the block on its full text, and two sides that differed by a
+    // single path looked like unrelated imports: ours's block was emptied
+    // and theirs's appended whole.
+    if is_go_import_block(line) {
+        return "import (";
+    }
     // For multi-line imports, search all lines for the source module
     // (e.g. `} from "./foo"` on the closing line)
     for l in line.lines() {
@@ -3856,6 +4045,84 @@ fn subtract(a: i32, b: i32) -> i32 {
         );
         eprintln!("Content:\n{}", result.content);
         // This tests whether Go import blocks (a single entity) get inner-merged
+    }
+
+    #[test]
+    fn test_go_import_block_header_added_while_theirs_drops_import() {
+        // Field case: one side adds a //nolint header above `package`, the
+        // other drops an import and edits the body. The grouped block came
+        // back as `"fmt",` lines (not Go), followed by the header and the bare
+        // paths again: the block was keyed on its full text, so the two sides'
+        // blocks looked unrelated, and its lines were re-merged as prose.
+        let base = "package canned\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"cloud.google.com/go/civil\"\n\n\tautomationv1beta1 \"github.com/sheerhealth/sheer/api/automation/v1beta1\"\n\t\"github.com/sheerhealth/sheer/internal/testing/fixture\"\n)\n\n// Sanity checks that canned responses render without error.\nfunc TestCanned(t *testing.T) {\n\tt.Parallel()\n\t_ = fixture.User1\n}\n";
+        let ours = format!(
+            "//nolint:forbidigo // Grandfathered numbered fixtures.\n{}",
+            base
+        );
+        let theirs = base
+            .replace("\t\"strings\"\n", "")
+            .replace("fixture.User1", "fixture.NewUser()");
+        let result = entity_merge(base, &ours, &theirs, "canned_test.go");
+        assert!(result.is_clean(), "conflicts: {:?}", result.conflicts);
+        let c = &result.content;
+        assert!(c.starts_with("//nolint:forbidigo"), "{c}");
+        assert_eq!(c.matches("//nolint:forbidigo").count(), 1, "{c}");
+        assert_eq!(c.matches("import (").count(), 1, "{c}");
+        assert!(
+            !c.lines().any(|l| l.trim_end().ends_with("\",")),
+            "comma-terminated import line:\n{c}"
+        );
+        assert!(!c.contains("\"strings\""), "{c}");
+        assert_eq!(c.matches("\"errors\"").count(), 1, "{c}");
+        assert_eq!(c.matches("// Sanity checks").count(), 1, "{c}");
+        assert!(c.contains("fixture.NewUser()"), "{c}");
+        // gofmt's blank-line groups survive
+        assert!(
+            c.contains("\t\"testing\"\n\n\t\"cloud.google.com/go/civil\"\n\n\tautomationv1beta1"),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn test_go_import_block_header_conflict_leaves_imports_intact() {
+        // Both sides rewrote the header above `package`; the imports are the
+        // same on both. The disagreement belongs to the header alone: markers
+        // there, the block once and untouched, and the merge NOT reported
+        // clean (the old path appended diffy's markers and called it clean).
+        let body = "package changestream\n\nimport (\n\t\"context\"\n\t\"testing\"\n\n\t\"cloud.google.com/go/spanner\"\n)\n\nfunc TestReadInsert(t *testing.T) {\n\tt.Parallel()\n}\n";
+        let base = format!("//nolint:forbidigo // header B\n{}", body);
+        let ours = format!("//nolint:forbidigo // header A\n{}", body);
+        let result = entity_merge(&base, &ours, body, "change_stream_test.go");
+        assert!(
+            !result.is_clean(),
+            "header disagreement must surface:\n{}",
+            result.content
+        );
+        let c = &result.content;
+        assert!(c.contains("<<<<<<<") && c.contains(">>>>>>>"), "{c}");
+        assert_eq!(c.matches("import (").count(), 1, "{c}");
+        assert_eq!(c.matches("\"context\"").count(), 1, "{c}");
+        assert!(!c.lines().any(|l| l.trim_end().ends_with("\",")), "{c}");
+        assert!(c.contains("header A") && c.contains("header B"), "{c}");
+        let close = c.rfind(">>>>>>>").unwrap();
+        let pkg = c.find("package changestream").unwrap();
+        assert!(
+            close < pkg,
+            "markers must close before the package clause:\n{c}"
+        );
+    }
+
+    #[test]
+    fn test_go_import_block_both_add_in_different_groups() {
+        let base = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\n\t\"cloud.google.com/go/civil\"\n)\n\nfunc main() {}\n";
+        let ours = "//nolint:forbidigo // grandfathered\npackage main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"strings\"\n\n\t\"cloud.google.com/go/civil\"\n)\n\nfunc main() {}\n";
+        let theirs = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\n\t\"cloud.google.com/go/civil\"\n\t\"github.com/google/uuid\"\n)\n\nfunc main() {}\n";
+        let result = entity_merge(base, ours, theirs, "main.go");
+        assert!(result.is_clean(), "conflicts: {:?}", result.conflicts);
+        assert_eq!(
+            result.content,
+            "//nolint:forbidigo // grandfathered\npackage main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"strings\"\n\n\t\"cloud.google.com/go/civil\"\n\t\"github.com/google/uuid\"\n)\n\nfunc main() {}\n"
+        );
     }
 
     #[test]
