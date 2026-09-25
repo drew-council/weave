@@ -3855,3 +3855,50 @@ fn issue_148_shared_top_level_text_survives_when_a_side_has_zero_entities() {
         result.content,
     );
 }
+
+// =============================================================================
+// Gaps between adjacent entities: an absent gap is a width of zero, not a
+// boundary to fill with the file's dominant separator
+// =============================================================================
+
+/// Field shape from a restacked Go branch: base's const group has blank lines
+/// between some specs, ours deletes them, theirs edits a function elsewhere.
+/// The deleted gaps merge to nothing and `slug`/`project` never had one; all
+/// three boundaries used to be filled with the base's dominant blank line.
+#[test]
+fn go_const_group_blank_lines_removed_by_one_side_stay_removed() {
+    let base = "package main\n\nimport \"fmt\"\n\nconst (\n\towner = \"sheerhealth\"\n\n\trepo  = \"sheer\"\n\n\tslug  = owner + \"/\" + repo\n\tproject = 9\n)\n\nfunc a() {\n\tfmt.Println(1)\n}\n";
+    let ours = "package main\n\nimport \"fmt\"\n\nconst (\n\towner = \"sheerhealth\"\n\trepo  = \"sheer\"\n\tslug  = owner + \"/\" + repo\n\tproject = 9\n)\n\nfunc a() {\n\tfmt.Println(1)\n}\n";
+    let theirs = base.replace("fmt.Println(1)", "fmt.Println(2)");
+
+    let result = entity_merge(base, ours, &theirs, "main.go");
+
+    assert!(result.is_clean(), "conflicts: {:?}", result.conflicts);
+    assert_eq!(
+        result.content,
+        ours.replace("fmt.Println(1)", "fmt.Println(2)")
+    );
+}
+
+/// Two entities with no gap between them in every version keep no gap, even
+/// when the file's dominant gap between other entities is a blank line.
+#[test]
+fn go_adjacent_specs_with_no_gap_get_no_synthesised_blank_line() {
+    let base = "package main\n\nimport \"fmt\"\n\nconst (\n\towner = \"sheerhealth\"\n\n\trepo  = \"sheer\"\n\n\tslug  = owner + \"/\" + repo\n\tproject = 9\n)\n\nfunc a() {\n\tfmt.Println(1)\n}\n\nfunc b() {\n\tfmt.Println(1)\n}\n";
+    let ours = base.replacen("fmt.Println(1)", "fmt.Println(2)", 1);
+    let theirs = base.replace(
+        "func b() {\n\tfmt.Println(1)",
+        "func b() {\n\tfmt.Println(3)",
+    );
+
+    let result = entity_merge(base, &ours, &theirs, "main.go");
+
+    assert!(result.is_clean(), "conflicts: {:?}", result.conflicts);
+    assert_eq!(
+        result.content,
+        ours.replace(
+            "func b() {\n\tfmt.Println(1)",
+            "func b() {\n\tfmt.Println(3)"
+        )
+    );
+}

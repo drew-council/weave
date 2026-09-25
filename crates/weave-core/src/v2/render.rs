@@ -46,6 +46,12 @@ pub(crate) struct Interstitials<'a> {
     lead_by_entity: HashMap<String, Vec<String>>,
     /// Keys no surviving entity leads — everything after the last one.
     trailing: Vec<String>,
+    /// Every (previous, next) pair of source ids that sit next to each other in
+    /// some version, whatever the gap between them. A boundary in this set
+    /// already exists, so an absent gap there is a stated width of zero: either
+    /// no version put anything between them, or the merge resolved the gap to
+    /// nothing because a side deleted it. Neither is a boundary to synthesise.
+    adjacent: HashSet<(String, String)>,
     /// What to put between two declarations that were never adjacent in any
     /// version, read off the base.
     separator: String,
@@ -70,12 +76,14 @@ impl<'a> Interstitials<'a> {
     ) -> Self {
         let mut lead_by_entity: HashMap<String, Vec<String>> = HashMap::new();
         let mut trailing: Vec<String> = Vec::new();
+        let mut adjacent: HashSet<(String, String)> = HashSet::new();
         let mut assigned: HashSet<&str> = HashSet::new();
         assigned.insert("file_header");
         assigned.insert("file_footer");
         assigned.insert("file_only");
         for list in regions {
             let mut pending: Vec<&str> = Vec::new();
+            let mut prev: Option<&str> = None;
             for region in list.iter() {
                 match region {
                     FileRegion::Interstitial(i) => {
@@ -86,6 +94,10 @@ impl<'a> Interstitials<'a> {
                         }
                     }
                     FileRegion::Entity(e) => {
+                        if let Some(p) = prev {
+                            adjacent.insert((p.to_string(), e.entity_id.clone()));
+                        }
+                        prev = Some(&e.entity_id);
                         if emitted.contains(&e.entity_id) && !pending.is_empty() {
                             lead_by_entity
                                 .entry(e.entity_id.clone())
@@ -105,8 +117,26 @@ impl<'a> Interstitials<'a> {
             merged,
             lead_by_entity,
             trailing,
+            adjacent,
             separator,
         }
+    }
+
+    /// Whether any version already has `prev` directly followed by `next`.
+    fn were_adjacent(&self, prev: &Triple, next: &Triple, arena: &Arena) -> bool {
+        let ids = |t: &Triple| {
+            [t.base_idx(), t.ours_idx(), t.theirs_idx()]
+                .into_iter()
+                .flatten()
+                .map(|idx| arena.get(idx).src_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let next_ids = ids(next);
+        ids(prev).into_iter().any(|p| {
+            next_ids
+                .iter()
+                .any(|n| self.adjacent.contains(&(p.clone(), n.clone())))
+        })
     }
 
     /// The gap keys that lead this triple, under whichever of its three source
@@ -299,7 +329,7 @@ pub(crate) fn render(
         })
         .collect();
 
-    let mut first = true;
+    let mut prev: Option<&Triple> = None;
     for (position, (item, text)) in emitting.iter().enumerate() {
         let triple = &triples[item.triple];
         if !out.is_empty() && !out.ends_with('\n') {
@@ -313,7 +343,7 @@ pub(crate) fn render(
             .filter(|k| spent.insert(k))
             .collect();
         if keys.is_empty() {
-            if !first {
+            if prev.is_some_and(|p| !interstitials.were_adjacent(p, triple, arena)) {
                 out.push_str(&interstitials.separator);
             }
         } else {
@@ -337,7 +367,7 @@ pub(crate) fn render(
             _ => member_separator,
         };
         push_entity(&mut out, text, sep);
-        first = false;
+        prev = Some(triple);
     }
 
     // Gaps nothing surviving leads, then the footer, then `file_only`. All
